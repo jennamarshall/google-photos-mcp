@@ -31,6 +31,10 @@ _CONFIG_DIR = Path(
 )
 
 
+def config_dir() -> Path:
+    return _CONFIG_DIR
+
+
 def client_secrets_path() -> Path:
     return Path(os.environ.get("GOOGLE_PHOTOS_CLIENT_SECRETS", _CONFIG_DIR / "client_secret.json"))
 

@@ -8,7 +8,10 @@ from google_photos_mcp.auth import StaticTokenProvider
 from google_photos_mcp.client import GooglePhotosClient
 from mcp.server.mcpserver.exceptions import ToolError
 
+from helpers import make_jpeg
+
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+JPEG = make_jpeg(gps=(48.8584, 2.2945), make="Google", model="Pixel 8")
 
 
 class FakeGoogle:
@@ -18,6 +21,7 @@ class FakeGoogle:
         self.requests: list[httpx.Request] = []
         self.albums: dict[str, dict] = {}
         self.media: dict[str, dict] = {}
+        self.uploads: list[tuple[str, bytes]] = []
         self.picked = [
             {
                 "id": f"p{i}",
@@ -62,6 +66,8 @@ class FakeGoogle:
                 return httpx.Response(404, json={"error": {"code": 404, "message": "Session not found"}})
 
         if url.host == "lh3.googleusercontent.com":
+            if path.startswith("/picked"):
+                return httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"})
             return httpx.Response(200, content=PNG + path.encode(), headers={"content-type": "image/png"})
 
         if url.host == "photoslibrary.googleapis.com":
@@ -82,20 +88,24 @@ class FakeGoogle:
                 return httpx.Response(200, json={})
             if m == "POST" and path == "/v1/uploads":
                 assert req.headers["x-goog-upload-protocol"] == "raw"
-                assert req.headers["x-goog-upload-content-type"] == "image/png"
-                return httpx.Response(200, text="upload-token-1")
+                assert req.headers["x-goog-upload-content-type"].startswith("image/")
+                self.uploads.append((req.headers["x-goog-upload-file-name"], req.content))
+                return httpx.Response(200, text=f"upload-token-{len(self.uploads)}")
             if m == "POST" and path == "/v1/mediaItems:batchCreate":
-                item = body["newMediaItems"][0]
-                mid = f"m{len(self.media)}"
-                self.media[mid] = {
-                    "id": mid, "filename": item["simpleMediaItem"]["fileName"],
-                    "description": item.get("description"), "mimeType": "image/png",
-                    "baseUrl": f"https://lh3.googleusercontent.com/lib{mid}",
-                }
-                return httpx.Response(200, json={"newMediaItemResults": [{
-                    "uploadToken": item["simpleMediaItem"]["uploadToken"],
-                    "status": {"message": "Success"}, "mediaItem": self.media[mid],
-                }]})
+                assert len(body["newMediaItems"]) <= 50
+                results = []
+                for item in body["newMediaItems"]:
+                    mid = f"m{len(self.media)}"
+                    self.media[mid] = {
+                        "id": mid, "filename": item["simpleMediaItem"]["fileName"],
+                        "description": item.get("description"), "mimeType": "image/png",
+                        "baseUrl": f"https://lh3.googleusercontent.com/lib{mid}",
+                    }
+                    results.append({
+                        "uploadToken": item["simpleMediaItem"]["uploadToken"],
+                        "status": {"message": "Success"}, "mediaItem": self.media[mid],
+                    })
+                return httpx.Response(200, json={"newMediaItemResults": results})
             if m == "POST" and path == "/v1/mediaItems:search":
                 return httpx.Response(200, json={"mediaItems": list(self.media.values()), "_body": body})
             if m == "GET" and path.startswith("/v1/mediaItems/"):
@@ -147,13 +157,13 @@ async def test_picker_flow(fake, tmp_path):
     # p2 not cached yet: the tool must page through the session to find it.
     res = await call("view_picked_media", session_id="sess1", media_item_id="p2", max_size=512)
     img = res.content[1]
-    assert img.type == "image" and img.mime_type == "image/png"
+    assert img.type == "image" and img.mime_type == "image/jpeg"
     assert fake.requests[-1].url.path == "/picked2=w512-h512"
 
     out = _text(await call("download_picked_media", session_id="sess1", media_item_id="p0",
                            destination_dir=str(tmp_path)))
     assert fake.requests[-1].url.path == "/picked0=d"
-    assert (tmp_path / "IMG_0.jpg").read_bytes().startswith(PNG)
+    assert (tmp_path / "IMG_0.jpg").read_bytes() == JPEG
     out2 = _text(await call("download_picked_media", session_id="sess1", media_item_id="p0",
                             destination_dir=str(tmp_path)))
     assert out2["path"].endswith("IMG_0 (1).jpg") and out["path"] != out2["path"]
@@ -212,3 +222,29 @@ async def test_upload_rejects_non_media(fake, tmp_path):
         await call("upload_photo", file_path=str(f))
     with pytest.raises(ToolError, match="No such file"):
         await call("upload_photo", file_path=str(tmp_path / "nope.jpg"))
+
+
+async def test_view_picked_batch_and_details(fake):
+    res = await call("view_picked_media_batch", session_id="sess1", limit=2)
+    kinds = [c.type for c in res.content]
+    assert kinds == ["text", "image", "text", "image", "text"]
+    assert json.loads(res.content[-1].text) == {"next_page_token": "2"}
+
+    details = _text(await call("get_picked_media_details", session_id="sess1", media_item_id="p1"))
+    assert details["exif"]["camera"] == "Google Pixel 8"
+    assert details["exif"]["latitude"] == pytest.approx(48.8584, abs=1e-4)
+    assert fake.requests[-1].url.path == "/picked1=d"
+
+
+async def test_copy_picked_to_new_album(fake):
+    out = _text(await call("copy_picked_to_album", session_id="sess1",
+                           media_item_ids=["p0", "p2"], new_album_title="Best of"))
+    assert out["album_id"] == "a0" and out["uploaded"] == 2
+    assert [u[0] for u in fake.uploads] == ["IMG_0.jpg", "IMG_2.jpg"]
+    assert fake.uploads[0][1] == JPEG  # original bytes, not a thumbnail
+    create = [r for r in fake.requests if r.url.path == "/v1/mediaItems:batchCreate"][-1]
+    assert json.loads(create.content)["albumId"] == "a0"
+
+    with pytest.raises(ToolError, match="not both"):
+        await call("copy_picked_to_album", session_id="sess1", media_item_ids=["p0"],
+                   album_id="a0", new_album_title="x")

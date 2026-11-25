@@ -248,6 +248,30 @@ class GooglePhotosClient:
         )
         return result["newMediaItemResults"][0]
 
+    async def upload_many(
+        self, files: list[dict[str, Any]], album_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """files: [{"load": async () -> bytes, "mime_type", "file_name", "description"?}].
+
+        Each file's bytes are loaded only while it uploads, so large batches don't
+        sit in memory. Media items are then created in batches of 50. Returns one
+        newMediaItemResult per file, in order.
+        """
+        results: list[dict[str, Any]] = []
+        for i in range(0, len(files), BATCH_LIMIT):
+            chunk = files[i : i + BATCH_LIMIT]
+            items = []
+            for f in chunk:
+                data = await f["load"]()
+                token = await self.upload_bytes(data, f["mime_type"], f["file_name"])
+                del data
+                items.append(
+                    {"uploadToken": token, "fileName": f["file_name"], "description": f.get("description")}
+                )
+            created = await self.batch_create(items, album_id)
+            results.extend(created.get("newMediaItemResults", []))
+        return results
+
     # ------------------------------------------------------------------ Content
 
     async def download(self, base_url: str, suffix: str) -> tuple[bytes, str]:

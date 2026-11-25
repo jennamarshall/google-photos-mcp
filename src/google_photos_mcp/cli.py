@@ -13,6 +13,9 @@ def main(argv: list[str] | None = None) -> None:
     auth = sub.add_parser("auth", help="Sign in to Google and store a token (run once).")
     auth.add_argument("--port", type=int, default=0, help="Loopback port for the OAuth redirect.")
 
+    index = sub.add_parser("index", help="Index a Google Takeout export / photo folder.")
+    index.add_argument("folder")
+
     serve = sub.add_parser("serve", help="Run the MCP server (default).")
     serve.add_argument(
         "--transport", choices=["stdio", "streamable-http"], default="stdio",
@@ -31,6 +34,20 @@ def main(argv: list[str] | None = None) -> None:
         except AuthError as e:
             sys.exit(str(e))
         print(f"Signed in. Token saved to {path}")
+        return
+
+    if args.command == "index":
+        from .server import get_library
+
+        print(f"Indexing {args.folder} ...", file=sys.stderr)
+        res = get_library().index(args.folder)
+        for e in res.errors[:20]:
+            print(f"  error: {e}", file=sys.stderr)
+        print(
+            f"Scanned {res.scanned}: {res.added} added, {res.updated} updated, "
+            f"{res.unchanged} unchanged, {res.removed} removed, "
+            f"{res.with_sidecar} with Takeout metadata, {len(res.errors)} errors."
+        )
         return
 
     from .server import mcp

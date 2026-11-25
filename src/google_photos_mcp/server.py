@@ -7,6 +7,9 @@ user's whole library. Two access paths remain, and this connector exposes both:
   can then read just those items (metadata + image bytes).
 * Library API: the connector can upload photos, create albums, and read or edit
   albums and media items that it created itself.
+
+For the whole library, the user exports it with Google Takeout and the
+connector indexes that export locally (see local_library.py).
 """
 
 from __future__ import annotations
@@ -21,20 +24,35 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
-from .auth import AuthError, StaticTokenProvider, TokenProvider
+from .auth import AuthError, StaticTokenProvider, TokenProvider, config_dir
 from .client import GooglePhotosClient, GooglePhotosError
+from .imaging import read_exif, thumbnail_jpeg
+from .local_library import LocalLibrary
 
 INSTRUCTIONS = """\
-Google Photos connector.
+Google Photos connector. Google no longer lets apps browse a user's whole
+library through its API, so there are three ways to work with photos:
 
-To look at a user's existing photos: call create_picker_session, give the user
-the picker_uri to open, wait for them to finish selecting, then call
-get_picker_session until media_items_set is true, then list_picked_media and
-view_picked_media. Access is limited to what the user picks.
+1. Whole library (best for searching, identifying, organizing): the user
+   exports Google Photos with Google Takeout and unzips it. Call
+   index_local_library on that folder once, then local_library_stats,
+   search_local_photos and view_local_photos. To identify photos, view them in
+   batches (search_local_photos with untagged=true), then save what you see with
+   annotate_local_photos (tags + a short note) so later searches find them.
+   Organize with export_local_photos (copies into folders) or
+   upload_local_photos (into a Google Photos album).
 
-Albums and media listed by list_albums / search_app_media are only those this
-connector created (Google no longer allows apps to browse the full library).
-Use upload_photo and create_album to add new content.
+2. Photos the user picks right now: create_picker_session, give the user the
+   picker_uri, poll get_picker_session until media_items_set is true, then
+   list_picked_media, view_picked_media_batch / view_picked_media, and
+   get_picked_media_details for EXIF. copy_picked_to_album puts copies of picked
+   photos into a connector-created album.
+
+3. Content this connector created: list_albums, search_app_media, etc.
+   Albums made elsewhere in Google Photos are not visible to the API.
+
+Copying or uploading creates new items in the user's library; confirm with the
+user before doing that in bulk.
 """
 
 mcp = MCPServer(name="google-photos", title="Google Photos", instructions=INSTRUCTIONS)
@@ -42,6 +60,7 @@ mcp = MCPServer(name="google-photos", title="Google Photos", instructions=INSTRU
 _client: GooglePhotosClient | None = None
 # id -> picked media item, filled as sessions are listed (baseUrls last ~60 minutes).
 _picked_cache: dict[str, dict[str, Any]] = {}
+_library: LocalLibrary | None = None
 
 
 def get_client() -> GooglePhotosClient:
@@ -50,6 +69,19 @@ def get_client() -> GooglePhotosClient:
         static = os.environ.get("GOOGLE_PHOTOS_ACCESS_TOKEN")
         _client = GooglePhotosClient(StaticTokenProvider(static) if static else TokenProvider())
     return _client
+
+
+def get_library() -> LocalLibrary:
+    global _library
+    if _library is None:
+        _library = LocalLibrary(os.environ.get("GOOGLE_PHOTOS_LIBRARY_DB") or config_dir() / "library.db")
+    return _library
+
+
+def set_library(library: LocalLibrary | None) -> None:
+    """Swap the local library (used by tests)."""
+    global _library
+    _library = library
 
 
 def set_client(client: GooglePhotosClient | None) -> None:
@@ -66,7 +98,7 @@ def _tool_errors(fn):
     async def wrapper(*args, **kwargs):
         try:
             return await fn(*args, **kwargs)
-        except (GooglePhotosError, AuthError, ValueError, FileNotFoundError) as e:
+        except (GooglePhotosError, AuthError, ValueError, OSError) as e:
             raise ToolError(str(e)) from e
 
     return wrapper
@@ -429,3 +461,347 @@ async def upload_photo(
     if "mediaItem" not in result:
         raise ValueError(f"Upload failed: {status.get('message', 'unknown error')}")
     return _summarize_media(result["mediaItem"])
+
+
+# ----------------------------------------------------------- more picker tools
+
+MAX_BATCH_IMAGES = 20
+
+
+@mcp.tool(annotations=READ)
+@_tool_errors
+async def view_picked_media_batch(
+    session_id: str,
+    media_item_ids: list[str] | None = None,
+    page_token: str | None = None,
+    limit: int = 12,
+    max_size: int = 512,
+) -> list:
+    """Look at several picked photos at once, e.g. to identify or sort them.
+
+    Give media_item_ids, or omit them to view the next page of the session.
+
+    Args:
+        session_id: The picker session.
+        media_item_ids: Specific ids from list_picked_media (max 20).
+        page_token: When paging through the whole session.
+        limit: Items to view when paging (1-20).
+        max_size: Longest edge in pixels (64-1024).
+    """
+    max_size = max(64, min(max_size, 1024))
+    next_token = None
+    if media_item_ids:
+        items = [await _find_picked(session_id, i) for i in media_item_ids[:MAX_BATCH_IMAGES]]
+    else:
+        page = await get_client().list_picked_media_items(
+            session_id, max(1, min(limit, MAX_BATCH_IMAGES)), page_token
+        )
+        items = page.get("mediaItems", [])
+        next_token = page.get("nextPageToken")
+        for item in items:
+            _picked_cache[item["id"]] = item
+    out: list = []
+    for item in items:
+        out.append(_summarize_picked(item))
+        base_url = item.get("mediaFile", {}).get("baseUrl")
+        if base_url:
+            data, _ = await get_client().download(base_url, f"w{max_size}-h{max_size}")
+            out.append(Image(data=thumbnail_jpeg(data, max_size), format="jpeg"))
+    out.append({"next_page_token": next_token} if next_token else {"done": True})
+    return out
+
+
+@mcp.tool(annotations=READ)
+@_tool_errors
+async def get_picked_media_details(session_id: str, media_item_id: str) -> dict[str, Any]:
+    """Full metadata for a picked photo, including EXIF (camera, lens, exposure, GPS if kept).
+
+    Downloads the original file to read it, so it is slower than list_picked_media.
+    """
+    item = await _find_picked(session_id, media_item_id)
+    info = _summarize_picked(item)
+    base_url = item.get("mediaFile", {}).get("baseUrl")
+    if item.get("type") == "PHOTO" and base_url:
+        data, _ = await get_client().download(base_url, "d")
+        info["exif"] = read_exif(data) or "No EXIF data in the file."
+    return info
+
+
+@mcp.tool(annotations=WRITE)
+@_tool_errors
+async def copy_picked_to_album(
+    session_id: str,
+    media_item_ids: list[str],
+    album_id: str | None = None,
+    new_album_title: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Put copies of picked photos into a connector-created album.
+
+    The API cannot add existing library items to albums, so this downloads each
+    original and uploads it again. The user's library gets a second copy of each
+    item; tell them that before doing it.
+
+    Args:
+        session_id: The picker session.
+        media_item_ids: Ids from list_picked_media.
+        album_id: An existing connector-created album, or
+        new_album_title: create a new album with this title.
+        description: Optional caption applied to every copy.
+    """
+    if not media_item_ids:
+        raise ValueError("Give at least one media item id.")
+    album_id = await _resolve_album(album_id, new_album_title)
+    items = [await _find_picked(session_id, i) for i in media_item_ids]
+    files = []
+    for item in items:
+        mf = item.get("mediaFile", {})
+        if not mf.get("baseUrl"):
+            raise ValueError(f"Media item {item['id']} has no downloadable content.")
+        suffix = "dv" if item.get("type") == "VIDEO" else "d"
+
+        async def load(url=mf["baseUrl"], suffix=suffix) -> bytes:
+            return (await get_client().download(url, suffix))[0]
+
+        files.append({
+            "load": load,
+            "mime_type": mf.get("mimeType") or "image/jpeg",
+            "file_name": mf.get("filename") or f"{item['id']}.jpg",
+            "description": description,
+        })
+    results = await get_client().upload_many(files, album_id)
+    return _upload_report(album_id, [i["id"] for i in items], results)
+
+
+async def _resolve_album(album_id: str | None, new_album_title: str | None) -> str | None:
+    if album_id and new_album_title:
+        raise ValueError("Give album_id or new_album_title, not both.")
+    if new_album_title:
+        if not new_album_title.strip():
+            raise ValueError("Album title cannot be empty.")
+        return (await get_client().create_album(new_album_title))["id"]
+    return album_id
+
+
+def _upload_report(album_id: str | None, source_ids: list, results: list[dict[str, Any]]) -> dict[str, Any]:
+    ok, failed = [], []
+    for src, r in zip(source_ids, results):
+        if "mediaItem" in r:
+            ok.append({"source": src, "media_item_id": r["mediaItem"]["id"]})
+        else:
+            failed.append({"source": src, "error": r.get("status", {}).get("message", "unknown error")})
+    return {"album_id": album_id, "uploaded": len(ok), "items": ok, "failed": failed}
+
+
+# ------------------------------------------------------- whole-library tools
+
+
+def _run(fn, *args, **kwargs):
+    import asyncio
+
+    return asyncio.to_thread(fn, *args, **kwargs)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_errors
+async def index_local_library(folder: str) -> dict[str, Any]:
+    """Index a Google Takeout export of Google Photos, or any folder of photos.
+
+    How the user gets the export: takeout.google.com -> deselect all -> Google
+    Photos -> export, then unzip every part into one folder. Point this at that
+    folder (or its "Takeout/Google Photos" subfolder).
+
+    Reads Takeout's JSON sidecars (date, GPS, description, people, favorites,
+    albums) with EXIF as fallback. Safe to re-run: unchanged files are skipped,
+    and files that were deleted are dropped from the index. Never modifies photos.
+    For very large libraries the CLI is faster: `google-photos-mcp index <folder>`.
+    """
+    res = await _run(get_library().index, folder)
+    out = {k: v for k, v in res.__dict__.items() if k != "errors"}
+    if res.errors:
+        out["error_count"] = len(res.errors)
+        out["errors"] = res.errors[:20]
+    return out
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@_tool_errors
+async def local_library_stats() -> dict[str, Any]:
+    """Overview of the indexed library: counts, years, albums, people, tags, cameras."""
+    return await _run(get_library().stats)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@_tool_errors
+async def search_local_photos(
+    text: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    album: str | None = None,
+    person: str | None = None,
+    tag: str | None = None,
+    media_type: Literal["PHOTO", "VIDEO"] | None = None,
+    favorite: bool | None = None,
+    has_location: bool | None = None,
+    near_latitude: float | None = None,
+    near_longitude: float | None = None,
+    radius_km: float = 10.0,
+    untagged: bool = False,
+    newest_first: bool = True,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Search the indexed library. All filters combine (AND).
+
+    Args:
+        text: Words matched against filename, description, notes, tags, people, albums, camera, folder.
+        start_date: YYYY-MM-DD, inclusive.
+        end_date: YYYY-MM-DD, inclusive.
+        album: Album name (substring).
+        person: Person name from Google Photos face groups (substring).
+        tag: Exact tag previously saved with annotate_local_photos.
+        media_type: PHOTO or VIDEO.
+        favorite: Only favorites (true) or non-favorites (false).
+        has_location: Only items with (true) or without (false) GPS.
+        near_latitude: With near_longitude and radius_km, items taken near a point.
+        near_longitude: See near_latitude.
+        radius_km: Search radius for near_*.
+        untagged: Only items not yet identified (no tags and no notes).
+        newest_first: Sort by date taken, newest first (default) or oldest first.
+        limit: 1-200 results.
+        offset: For paging.
+    """
+    for d in (start_date, end_date):
+        if d:
+            _parse_date(d)
+    near = None
+    if (near_latitude is None) != (near_longitude is None):
+        raise ValueError("Give both near_latitude and near_longitude.")
+    if near_latitude is not None:
+        near = (near_latitude, near_longitude, radius_km)
+    return await _run(
+        get_library().search, text=text, start_date=start_date, end_date=end_date, album=album,
+        person=person, tag=tag, media_type=media_type, favorite=favorite, has_location=has_location,
+        near=near, untagged=untagged, newest_first=newest_first,
+        limit=max(1, min(limit, 200)), offset=max(0, offset),
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@_tool_errors
+async def view_local_photos(photo_ids: list[int], max_size: int = 768) -> list:
+    """Look at indexed photos (up to 20 at a time) with their metadata.
+
+    Use this to identify what's in photos, then save the result with
+    annotate_local_photos. Videos and RAW files are described but not shown.
+    """
+    if not photo_ids:
+        raise ValueError("Give at least one photo id.")
+    max_size = max(64, min(max_size, 2048 if len(photo_ids) == 1 else 1024))
+    photos = await _run(get_library().get, photo_ids[:MAX_BATCH_IMAGES])
+    out: list = []
+    for ph in photos:
+        out.append(ph)
+        if ph.get("media_type") != "PHOTO":
+            continue
+        try:
+            out.append(Image(data=await _run(thumbnail_jpeg, ph["path"], max_size), format="jpeg"))
+        except Exception as e:  # unsupported format, missing file
+            out.append(f"(Could not render photo {ph['id']}: {e})")
+    missing = sorted(set(photo_ids[:MAX_BATCH_IMAGES]) - {p["id"] for p in photos})
+    if missing:
+        out.append({"unknown_ids": missing})
+    if len(photo_ids) > MAX_BATCH_IMAGES:
+        out.append(f"Showed the first {MAX_BATCH_IMAGES}; call again for the rest.")
+    return out
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_errors
+async def annotate_local_photos(
+    photo_ids: list[int],
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+    notes: str | None = None,
+) -> str:
+    """Save identifications for photos: tags (e.g. "dog", "beach", "receipt") and a note.
+
+    Stored in the local index only (Google's API cannot edit existing photos),
+    and searchable with search_local_photos. Tags are lower-cased. A note
+    replaces any previous note; pass "" to clear it. The same tags/note apply to
+    every id given, so batch photos that share them.
+    """
+    if not photo_ids:
+        raise ValueError("Give at least one photo id.")
+    if not (add_tags or remove_tags or notes is not None):
+        raise ValueError("Nothing to save: give add_tags, remove_tags or notes.")
+    n = await _run(get_library().annotate, photo_ids, add_tags, remove_tags, notes)
+    return f"Updated {n} photo(s)." + ("" if n == len(set(photo_ids)) else " Some ids were not found.")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+@_tool_errors
+async def export_local_photos(
+    photo_ids: list[int],
+    destination_dir: str,
+    layout: Literal["year-month", "year", "album", "flat"] = "year-month",
+) -> dict[str, Any]:
+    """Copy indexed photos into an organized folder structure.
+
+    Originals are never moved or deleted. Name clashes get " (1)" suffixes.
+
+    Args:
+        photo_ids: Photos to copy (e.g. from search_local_photos).
+        destination_dir: Folder to copy into.
+        layout: year-month -> 2024/06/, year -> 2024/, album -> <album name>/, flat.
+    """
+    if not photo_ids:
+        raise ValueError("Give at least one photo id.")
+    res = await _run(get_library().export, photo_ids, destination_dir, layout)
+    if len(res["files"]) > 50:
+        res["files"] = res["files"][:50] + [f"... and {len(res['files']) - 50} more"]
+    return res
+
+
+@mcp.tool(annotations=WRITE)
+@_tool_errors
+async def upload_local_photos(
+    photo_ids: list[int],
+    album_id: str | None = None,
+    new_album_title: str | None = None,
+    use_notes_as_description: bool = False,
+) -> dict[str, Any]:
+    """Upload indexed photos to Google Photos, optionally into an album.
+
+    Use this to build albums from a search (e.g. all photos tagged "wedding").
+    If the photos came from a Takeout export they are already in the user's
+    library, so this adds copies; confirm with the user first.
+
+    Args:
+        photo_ids: Photos to upload.
+        album_id: An existing connector-created album, or
+        new_album_title: create a new album with this title.
+        use_notes_as_description: Use each photo's saved note (or Takeout description) as its caption.
+    """
+    if not photo_ids:
+        raise ValueError("Give at least one photo id.")
+    photos = await _run(get_library().get, photo_ids)
+    if not photos:
+        raise ValueError("None of those photo ids are in the index.")
+    album_id = await _resolve_album(album_id, new_album_title)
+    files = []
+    for ph in photos:
+        path = Path(ph["path"])
+
+        async def load(path=path) -> bytes:
+            return await _run(path.read_bytes)
+
+        desc = (ph.get("notes") or ph.get("description")) if use_notes_as_description else None
+        files.append({
+            "load": load,
+            "mime_type": ph.get("mime_type") or "application/octet-stream",
+            "file_name": path.name,
+            "description": desc[:1000] if desc else None,
+        })
+    results = await get_client().upload_many(files, album_id)
+    return _upload_report(album_id, [p["id"] for p in photos], results)

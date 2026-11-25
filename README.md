@@ -2,33 +2,41 @@
 
 An [MCP](https://modelcontextprotocol.io) server that connects Claude (Claude Desktop, Claude Code, or any MCP client) to Google Photos.
 
-## What it can do (and why it's shaped this way)
+## What it can do
 
-On **31 March 2025** Google removed the scopes that let third-party apps browse a user's whole Google Photos library. Two ways in are left, and this connector supports both:
+On **31 March 2025** Google removed the API scopes that let third-party apps read a user's whole Google Photos library. No connector can browse, scan or reorganize your entire library through Google's API any more. This connector gets as close as Google allows in three ways:
 
-| Access path | What Claude can do |
-|---|---|
-| **Picker API** | You pick photos in Google Photos' own picker. Claude can then list, view (as images) and download **only the items you picked**. |
-| **Library API (app-created data)** | Upload photos and videos, create and rename albums, add captions and text, and list, search and view **the content this connector created**. |
+| Mode | Covers | What Claude can do |
+|---|---|---|
+| **Whole library, via Google Takeout** | Everything you export | Search by date, place, person, album, favorite or text. View photos, **identify** what's in them and save tags and notes. **Organize** copies into folders by year, month or album, or upload a selection into a Google Photos album. |
+| **Picker** | Photos you pick in Google Photos' own picker | List and view many at once, read EXIF (camera, exposure, GPS if present), download originals, copy them into albums. |
+| **Connector-created content** | Albums and uploads made by this connector | Create, rename and caption albums. Add or remove items, search, view, edit descriptions. |
+
+What still isn't possible: adding existing library photos to an album, editing existing photos or their dates and locations, or deleting anything. Google's API doesn't allow any of these. Tools that "move" photos into albums upload **copies**, and they say so.
+
+### Whole library (Takeout)
+
+1. Go to [takeout.google.com](https://takeout.google.com), click **Deselect all**, tick **Google Photos**, and export.
+2. Unzip every part into one folder.
+3. Ask Claude to index it: *"Index my photos in ~/Takeout"*. Or run `google-photos-mcp index ~/Takeout`, which is faster for very large libraries.
+
+The index is a SQLite file at `~/.config/google-photos-mcp/library.db`. Your photo files are never modified. The index reads Takeout's JSON sidecars, including the newer `.supplemental-metadata.json` names, Takeout's truncated names, `(1)` duplicates and `-edited` copies. For a plain folder of photos with no sidecars, it reads EXIF instead. A photo that appears in several album folders becomes a single entry that lists all of its albums.
+
+**Identifying photos.** Claude asks for photos it hasn't identified yet (`search_local_photos untagged=true`), views them in batches of up to 20, and saves tags and a note with `annotate_local_photos`. After that, *"find the receipts"* or *"photos of the dog at the beach"* work as searches. Re-indexing keeps the tags.
 
 ### Tools
 
-**Picker (your existing photos)**
-- `create_picker_session` returns a `picker_uri` for you to open and pick photos
+**Whole library:** `index_local_library`, `local_library_stats`, `search_local_photos`, `view_local_photos`, `annotate_local_photos`, `export_local_photos` (copy only), `upload_local_photos`
+
+**Picker (photos you pick):**
+- `create_picker_session` returns a `picker_uri` for you to open
 - `get_picker_session` checks whether you've finished picking
-- `list_picked_media` lists the items you picked, with metadata
-- `view_picked_media` returns a resized image so Claude can look at it
-- `download_picked_media` saves the original file to a local folder
-- `delete_picker_session` ends the session
+- `list_picked_media`, `view_picked_media`, `view_picked_media_batch`
+- `get_picked_media_details` reads EXIF
+- `download_picked_media` saves originals
+- `copy_picked_to_album`, `delete_picker_session`
 
-**Library (content this connector created)**
-- `create_album`, `get_album`, `list_albums`, `update_album`, `add_album_text`
-- `upload_photo` uploads a local image or video, optionally into an album with a caption
-- `add_media_to_album`, `remove_media_from_album`
-- `search_app_media` lists items by album, date range or media type
-- `view_app_media`, `update_media_description`
-
-A typical conversation: *"Pick the photos from our trip and write captions for them."* Claude creates a picker session and gives you the link. You choose the photos, and Claude views each one and writes the captions.
+**Connector-created content:** `create_album`, `get_album`, `list_albums`, `update_album`, `add_album_text`, `upload_photo`, `add_media_to_album`, `remove_media_from_album`, `search_app_media`, `view_app_media`, `update_media_description`
 
 ## Setup
 
@@ -77,12 +85,15 @@ claude mcp add google-photos -- google-photos-mcp serve
 | `GOOGLE_PHOTOS_CONFIG_DIR` | `~/.config/google-photos-mcp` | Where the secrets and token live |
 | `GOOGLE_PHOTOS_CLIENT_SECRETS` | `<config>/client_secret.json` | OAuth client JSON |
 | `GOOGLE_PHOTOS_TOKEN_FILE` | `<config>/token.json` | Cached token |
+| `GOOGLE_PHOTOS_LIBRARY_DB` | `<config>/library.db` | Local library index |
 | `GOOGLE_PHOTOS_ACCESS_TOKEN` | — | Use a fixed access token instead (for testing) |
 
 ## Limits to know about
 
 - Picked-item URLs expire about 60 minutes after the session's items are listed. Picker sessions also expire. Start a new one if needed.
-- Library tools only see albums and media that this connector created, so photos picked through the Picker can't be added to albums.
+- Album and search tools on the Google side only see albums and media that this connector created. Use the Takeout index for everything else.
+- The Takeout index is a snapshot. Export again and re-index to pick up new photos. Re-indexing is incremental.
+- HEIC/HEIF (iPhone) photos are supported. RAW files and videos are indexed and searchable, but Claude can't view them.
 - Uploads are capped at 200 MB per file here.
 - Nothing in this connector deletes photos (the Google API doesn't allow it). `remove_media_from_album` only takes an item out of the album.
 
@@ -94,4 +105,4 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The tests run every tool against a fake Google API (`httpx.MockTransport`), so they need no network or credentials.
+The tests run every tool against a fake Google API (`httpx.MockTransport`) and a generated Takeout-style folder, so they need no network or credentials.
