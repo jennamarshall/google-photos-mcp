@@ -1,6 +1,9 @@
 # Google Photos connector
 
-An [MCP](https://modelcontextprotocol.io) server that connects Claude (Claude Desktop, Claude Code, or any MCP client) to Google Photos.
+An [MCP](https://modelcontextprotocol.io) server that connects Claude to Google Photos. You can use it two ways:
+
+- **Hosted**, for claude.ai and the **Claude mobile apps**: deploy it once (free tier of Google Cloud Run), add it as a custom connector, and sign in with Google from any device. See [Use it from your phone](#use-it-from-your-phone-hosted).
+- **Local**, for Claude Desktop or Claude Code on your computer. This mode adds the whole-library tools that work on a Google Takeout export.
 
 ## What it can do
 
@@ -76,7 +79,48 @@ claude mcp add google-photos -- google-photos-mcp serve
 }
 ```
 
-**Remote / HTTP**: `google-photos-mcp serve --transport streamable-http --host 127.0.0.1 --port 8000` serves the MCP endpoint at `/mcp`. It uses the single token stored on the host and has **no authentication of its own**. Don't expose it publicly without putting an authenticating proxy in front of it.
+For claude.ai and phones, use the hosted mode above. (`serve --transport streamable-http` also exists, but it has no sign-in and uses the host's own token. Keep it on localhost.)
+
+## Use it from your phone (hosted)
+
+The Claude mobile app can't run programs on your phone. It uses *remote* connectors, which you add once in claude.ai and which then appear on every device. `google-photos-mcp remote` runs this connector as one.
+
+**In the hosted version:**
+- You sign in with Google from the Claude app. Nothing is installed on the phone.
+- The picker works well on a phone. Claude sends a link that opens the **Google Photos app**, you tap the photos you want, then return to Claude, which can view, describe, identify and caption them, and copy them into albums.
+- Album and upload tools for connector-created content are included.
+- The whole-library (Takeout) tools and anything that reads or writes local files are left out, because those files are on your computer.
+
+### Deploy to Google Cloud Run (about 10 minutes, free at personal volumes)
+
+You can do all of this from a browser, even on your phone, with **Google Cloud Shell**:
+
+1. Open https://shell.cloud.google.com and select (or create) your Google Cloud project: `gcloud config set project YOUR_PROJECT`.
+2. On the **OAuth consent screen**, add your Google account under **Test users**, if you haven't already.
+3. Clone this repo and run the deploy script:
+   ```bash
+   git clone https://github.com/jennamarshall/google-photos-mcp && cd google-photos-mcp
+   ALLOWED_EMAILS=you@gmail.com ./deploy/cloudrun.sh
+   ```
+   (If the repo is private, clone with a GitHub token: `https://<token>@github.com/...`.)
+4. The script enables the APIs and prints a **redirect URI**. In the console it links to, create an **OAuth client ID** of type **Web application** with that redirect URI. Paste the client ID and secret back into the script. The script stores secrets in Secret Manager, deploys, and prints your connector URL.
+5. In **claude.ai → Settings → Connectors → Add custom connector**, paste the URL (`https://…run.app/mcp`) and click **Connect**. It now shows up in the Claude app on your phone.
+
+**Security:**
+- Only accounts in `ALLOWED_EMAILS` can sign in. Anyone else's Google grant is revoked straight away.
+- The server is stateless: registrations, codes and tokens are encrypted with `SERVER_SECRET` (AES-GCM, purpose-bound), so there is no database to protect.
+- Disconnecting the connector in Claude revokes the Google grant.
+- Rotating `SERVER_SECRET` signs everyone out.
+
+**Hosting it elsewhere:** build the `Dockerfile`, or run `pip install . && google-photos-mcp remote` behind HTTPS, with these environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `PUBLIC_URL` | The server's public `https://` base URL |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | A **Web application** OAuth client whose redirect URI is `PUBLIC_URL/oauth/google/callback` |
+| `SERVER_SECRET` | 32+ random characters used to encrypt tokens |
+| `ALLOWED_EMAILS` | Comma-separated Google accounts allowed to sign in (or `ALLOW_ANY_GOOGLE_ACCOUNT=1`) |
+| `PORT` | Listen port (default 8080) |
 
 ## Configuration
 
@@ -105,4 +149,4 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The tests run every tool against a fake Google API (`httpx.MockTransport`) and a generated Takeout-style folder, so they need no network or credentials.
+The tests run every tool against a fake Google API (`httpx.MockTransport`) and a generated Takeout-style folder, so they need no network or credentials. `tests/test_remote.py` runs the full hosted sign-in flow (registration, Google consent, PKCE, refresh, revoke) against a fake Google.

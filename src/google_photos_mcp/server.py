@@ -24,6 +24,8 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+
 from .auth import AuthError, StaticTokenProvider, TokenProvider, config_dir
 from .client import GooglePhotosClient, GooglePhotosError
 from .imaging import read_exif, thumbnail_jpeg
@@ -55,11 +57,50 @@ Copying or uploading creates new items in the user's library; confirm with the
 user before doing that in bulk.
 """
 
-mcp = MCPServer(name="google-photos", title="Google Photos", instructions=INSTRUCTIONS)
+REMOTE_INSTRUCTIONS = """\
+Google Photos connector (remote). Google no longer lets apps browse a user's
+whole library, so work with photos the user picks:
+
+create_picker_session, give the user the picker_uri (on a phone it opens the
+Google Photos app), poll get_picker_session until media_items_set is true, then
+list_picked_media, view_picked_media_batch / view_picked_media, and
+get_picked_media_details for EXIF. copy_picked_to_album puts copies of picked
+photos into a connector-created album (confirm first: it adds copies).
+
+list_albums, search_app_media etc. only see content this connector created.
+"""
+
+# (function, annotations, local_only) for every tool; build_server() registers them.
+TOOLS: list[tuple[Any, ToolAnnotations, bool]] = []
+
+
+def tool(annotations: ToolAnnotations, local: bool = False):
+    """Register a tool. local=True tools touch this machine's files and are left
+    out of the remote (hosted) server."""
+
+    def deco(fn):
+        TOOLS.append((fn, annotations, local))
+        return fn
+
+    return deco
 
 _client: GooglePhotosClient | None = None
 # id -> picked media item, filled as sessions are listed (baseUrls last ~60 minutes).
-_picked_cache: dict[str, dict[str, Any]] = {}
+# Keyed by (user, session, item) so a hosted server never mixes users' items.
+_picked_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+_PICKED_CACHE_MAX = 5000
+
+
+def _user_key() -> str:
+    token = get_access_token()
+    return (token.subject or token.client_id) if token else "local"
+
+
+def _cache_put(session_id: str, item: dict[str, Any]) -> None:
+    if len(_picked_cache) >= _PICKED_CACHE_MAX:
+        for k in list(_picked_cache)[: _PICKED_CACHE_MAX // 5]:  # drop the oldest 20%
+            del _picked_cache[k]
+    _picked_cache[(_user_key(), session_id, item["id"])] = item
 _library: LocalLibrary | None = None
 
 
@@ -163,15 +204,16 @@ def _parse_date(value: str) -> dict[str, int]:
 
 
 async def _find_picked(session_id: str, media_item_id: str) -> dict[str, Any]:
-    if media_item_id in _picked_cache:
-        return _picked_cache[media_item_id]
+    key = (_user_key(), session_id, media_item_id)
+    if key in _picked_cache:
+        return _picked_cache[key]
     token = None
     while True:
         page = await get_client().list_picked_media_items(session_id, 100, token)
         for item in page.get("mediaItems", []):
-            _picked_cache[item["id"]] = item
-        if media_item_id in _picked_cache:
-            return _picked_cache[media_item_id]
+            _cache_put(session_id, item)
+        if key in _picked_cache:
+            return _picked_cache[key]
         token = page.get("nextPageToken")
         if not token:
             raise ValueError(f"Media item {media_item_id} is not in picker session {session_id}.")
@@ -180,7 +222,7 @@ async def _find_picked(session_id: str, media_item_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------- Picker tools
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE)
 @_tool_errors
 async def create_picker_session(max_items: int | None = None) -> dict[str, Any]:
     """Start a Google Photos picker session so the user can choose photos to share.
@@ -205,7 +247,7 @@ async def create_picker_session(max_items: int | None = None) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def get_picker_session(session_id: str) -> dict[str, Any]:
     """Check whether the user has finished picking photos in a picker session."""
@@ -222,7 +264,7 @@ async def get_picker_session(session_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def list_picked_media(
     session_id: str, page_size: int = 50, page_token: str | None = None
@@ -239,14 +281,14 @@ async def list_picked_media(
     )
     items = page.get("mediaItems", [])
     for item in items:
-        _picked_cache[item["id"]] = item
+        _cache_put(session_id, item)
     return {
         "media_items": [_summarize_picked(i) for i in items],
         "next_page_token": page.get("nextPageToken"),
     }
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def view_picked_media(session_id: str, media_item_id: str, max_size: int = 1024) -> list:
     """Fetch a picked photo as an image so you can look at it.
@@ -268,7 +310,7 @@ async def view_picked_media(session_id: str, media_item_id: str, max_size: int =
     return [_summarize_picked(item), Image(data=data, format=fmt)]
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE, local=True)
 @_tool_errors
 async def download_picked_media(
     session_id: str, media_item_id: str, destination_dir: str
@@ -298,19 +340,21 @@ async def download_picked_media(
     return {"path": str(target), "bytes": len(data)}
 
 
-@mcp.tool(annotations=EDIT)
+@tool(EDIT)
 @_tool_errors
 async def delete_picker_session(session_id: str) -> str:
     """End a picker session once you are done with it (frees its media URLs)."""
     await get_client().delete_picker_session(session_id)
-    _picked_cache.clear()
+    user = _user_key()
+    for k in [k for k in _picked_cache if k[0] == user and k[1] == session_id]:
+        del _picked_cache[k]
     return f"Deleted picker session {session_id}."
 
 
 # --------------------------------------------------------------- Library tools
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def list_albums(page_size: int = 20, page_token: str | None = None) -> dict[str, Any]:
     """List albums created by this connector.
@@ -326,14 +370,14 @@ async def list_albums(page_size: int = 20, page_token: str | None = None) -> dic
     }
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def get_album(album_id: str) -> dict[str, Any]:
     """Get details of an album created by this connector."""
     return _summarize_album(await get_client().get_album(album_id))
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE)
 @_tool_errors
 async def create_album(title: str) -> dict[str, Any]:
     """Create a new album in the user's Google Photos library."""
@@ -344,7 +388,7 @@ async def create_album(title: str) -> dict[str, Any]:
     return _summarize_album(await get_client().create_album(title))
 
 
-@mcp.tool(annotations=EDIT)
+@tool(EDIT)
 @_tool_errors
 async def update_album(
     album_id: str, title: str | None = None, cover_media_item_id: str | None = None
@@ -353,7 +397,7 @@ async def update_album(
     return _summarize_album(await get_client().update_album(album_id, title, cover_media_item_id))
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE)
 @_tool_errors
 async def add_album_text(album_id: str, text: str) -> str:
     """Append a text caption block to the end of an album."""
@@ -361,7 +405,7 @@ async def add_album_text(album_id: str, text: str) -> str:
     return f"Added text to album {album_id}."
 
 
-@mcp.tool(annotations=EDIT)
+@tool(EDIT)
 @_tool_errors
 async def add_media_to_album(album_id: str, media_item_ids: list[str]) -> str:
     """Add connector-uploaded media items to a connector-created album."""
@@ -371,7 +415,7 @@ async def add_media_to_album(album_id: str, media_item_ids: list[str]) -> str:
     return f"Added {len(media_item_ids)} item(s) to album {album_id}."
 
 
-@mcp.tool(annotations=EDIT)
+@tool(EDIT)
 @_tool_errors
 async def remove_media_from_album(album_id: str, media_item_ids: list[str]) -> str:
     """Remove media items from a connector-created album (does not delete them)."""
@@ -381,7 +425,7 @@ async def remove_media_from_album(album_id: str, media_item_ids: list[str]) -> s
     return f"Removed {len(media_item_ids)} item(s) from album {album_id}."
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def search_app_media(
     album_id: str | None = None,
@@ -422,7 +466,7 @@ async def search_app_media(
     }
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def view_app_media(media_item_id: str, max_size: int = 1024) -> list:
     """Fetch a connector-uploaded photo as an image so you can look at it."""
@@ -433,7 +477,7 @@ async def view_app_media(media_item_id: str, max_size: int = 1024) -> list:
     return [_summarize_media(item), Image(data=data, format=fmt)]
 
 
-@mcp.tool(annotations=EDIT)
+@tool(EDIT)
 @_tool_errors
 async def update_media_description(media_item_id: str, description: str) -> dict[str, Any]:
     """Set the description (caption) of a connector-uploaded media item."""
@@ -442,7 +486,7 @@ async def update_media_description(media_item_id: str, description: str) -> dict
     return _summarize_media(await get_client().update_media_description(media_item_id, description))
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE, local=True)
 @_tool_errors
 async def upload_photo(
     file_path: str, album_id: str | None = None, description: str | None = None
@@ -468,7 +512,7 @@ async def upload_photo(
 MAX_BATCH_IMAGES = 20
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def view_picked_media_batch(
     session_id: str,
@@ -499,7 +543,7 @@ async def view_picked_media_batch(
         items = page.get("mediaItems", [])
         next_token = page.get("nextPageToken")
         for item in items:
-            _picked_cache[item["id"]] = item
+            _cache_put(session_id, item)
     out: list = []
     for item in items:
         out.append(_summarize_picked(item))
@@ -511,7 +555,7 @@ async def view_picked_media_batch(
     return out
 
 
-@mcp.tool(annotations=READ)
+@tool(READ)
 @_tool_errors
 async def get_picked_media_details(session_id: str, media_item_id: str) -> dict[str, Any]:
     """Full metadata for a picked photo, including EXIF (camera, lens, exposure, GPS if kept).
@@ -527,7 +571,7 @@ async def get_picked_media_details(session_id: str, media_item_id: str) -> dict[
     return info
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE)
 @_tool_errors
 async def copy_picked_to_album(
     session_id: str,
@@ -602,7 +646,7 @@ def _run(fn, *args, **kwargs):
     return asyncio.to_thread(fn, *args, **kwargs)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@tool(ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True), local=True)
 @_tool_errors
 async def index_local_library(folder: str) -> dict[str, Any]:
     """Index a Google Takeout export of Google Photos, or any folder of photos.
@@ -624,14 +668,14 @@ async def index_local_library(folder: str) -> dict[str, Any]:
     return out
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@tool(ToolAnnotations(readOnlyHint=True), local=True)
 @_tool_errors
 async def local_library_stats() -> dict[str, Any]:
     """Overview of the indexed library: counts, years, albums, people, tags, cameras."""
     return await _run(get_library().stats)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@tool(ToolAnnotations(readOnlyHint=True), local=True)
 @_tool_errors
 async def search_local_photos(
     text: str | None = None,
@@ -687,7 +731,7 @@ async def search_local_photos(
     )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+@tool(ToolAnnotations(readOnlyHint=True), local=True)
 @_tool_errors
 async def view_local_photos(photo_ids: list[int], max_size: int = 768) -> list:
     """Look at indexed photos (up to 20 at a time) with their metadata.
@@ -716,7 +760,7 @@ async def view_local_photos(photo_ids: list[int], max_size: int = 768) -> list:
     return out
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@tool(ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True), local=True)
 @_tool_errors
 async def annotate_local_photos(
     photo_ids: list[int],
@@ -739,7 +783,7 @@ async def annotate_local_photos(
     return f"Updated {n} photo(s)." + ("" if n == len(set(photo_ids)) else " Some ids were not found.")
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+@tool(ToolAnnotations(readOnlyHint=False, destructiveHint=False), local=True)
 @_tool_errors
 async def export_local_photos(
     photo_ids: list[int],
@@ -763,7 +807,7 @@ async def export_local_photos(
     return res
 
 
-@mcp.tool(annotations=WRITE)
+@tool(WRITE, local=True)
 @_tool_errors
 async def upload_local_photos(
     photo_ids: list[int],
@@ -805,3 +849,31 @@ async def upload_local_photos(
         })
     results = await get_client().upload_many(files, album_id)
     return _upload_report(album_id, [p["id"] for p in photos], results)
+
+
+def build_server(remote: Any = None) -> MCPServer:
+    """Build the MCP server.
+
+    remote: a remote.RemoteConfig to serve over HTTPS with OAuth (Google sign-in),
+    for use from claude.ai and the Claude mobile apps. None for local use.
+    """
+    if remote is None:
+        server = MCPServer(name="google-photos", title="Google Photos", instructions=INSTRUCTIONS)
+    else:
+        server = MCPServer(
+            name="google-photos",
+            title="Google Photos",
+            instructions=REMOTE_INSTRUCTIONS,
+            auth_server_provider=remote.provider,
+            auth=remote.auth_settings,
+        )
+        remote.add_routes(server)
+        set_client(GooglePhotosClient(remote.token_source))
+    for fn, annotations, local in TOOLS:
+        if remote is not None and local:
+            continue
+        server.add_tool(fn, annotations=annotations)
+    return server
+
+
+mcp = build_server()

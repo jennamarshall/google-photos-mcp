@@ -13,6 +13,12 @@ def main(argv: list[str] | None = None) -> None:
     auth = sub.add_parser("auth", help="Sign in to Google and store a token (run once).")
     auth.add_argument("--port", type=int, default=0, help="Loopback port for the OAuth redirect.")
 
+    remote = sub.add_parser(
+        "remote", help="Run as a hosted connector for claude.ai and the Claude mobile apps (OAuth)."
+    )
+    remote.add_argument("--host", default="0.0.0.0")
+    remote.add_argument("--port", type=int, default=None, help="Defaults to $PORT, then 8080.")
+
     index = sub.add_parser("index", help="Index a Google Takeout export / photo folder.")
     index.add_argument("folder")
 
@@ -34,6 +40,20 @@ def main(argv: list[str] | None = None) -> None:
         except AuthError as e:
             sys.exit(str(e))
         print(f"Signed in. Token saved to {path}")
+        return
+
+    if args.command == "remote":
+        import logging
+        import os
+
+        from .remote import RemoteConfig
+        from .server import build_server
+
+        logging.basicConfig(level=logging.INFO)
+        cfg = RemoteConfig.from_env()
+        server = build_server(cfg)
+        port = args.port or int(os.environ.get("PORT", "8080"))
+        server.run("streamable-http", host=args.host, port=port, transport_security=cfg.transport_security)
         return
 
     if args.command == "index":
